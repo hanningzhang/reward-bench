@@ -22,7 +22,9 @@ import json
 import os
 import re
 import time as time
+import concurrent.futures
 
+import boto3
 import anthropic
 import google.generativeai as genai
 import openai
@@ -47,6 +49,8 @@ ANTHROPIC_MODEL_LIST = (
     "claude-3-sonnet-20240229",
     "claude-3-haiku-20240307",
     "claude-3-5-sonnet-20240620",
+    "claude-sonnet-4",
+    "claude-sonnet-3.7"
 )
 
 OPENAI_MODEL_LIST = (
@@ -105,6 +109,90 @@ prompt_v2 = (
     "You should choose the assistant that follows the user's instructions and answers the user's question better. "
     "Your evaluation should consider factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. "
     "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+    "After providing your explanation, output your final verdict by strictly following this format: "  # This is not in `prompt_v2_gemini`
+    '"[[A]]" if assistant A is better, "[[B]]" if assistant B is better.'  # removed tie option as , and \"[[C]]\ " for a tie;   # This is not in `prompt_v2_gemini`
+)
+
+prompt_v2_helpfulness = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Helpfulness. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_instruction = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Instruction-Following. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_verbosity = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Verbosity. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_correctness = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Correctness. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_truthfulness = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Truthfulness. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_honesty = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Your evaluation should only consider the factor: Honesty. "
+    "Begin your evaluation by comparing the two responses and provide a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+)
+
+prompt_v2_overall = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question given the judgment results of each attribute."
+    "You should choose the assistant that follows the user's instructions and answers the user's question better. "
+    "Below we provide the judgment result of each attribute. "
+    "Helpfulness: "
+    "{Helpfulness} "
+    "Instruction-Following: "
+    "{Instruction} "
+    "Verbosity: "
+    "{Verbosity} "
+    "Correctness: "
+    "{Correctness} "
+    "Trustfulness: "
+    "{Truthfulness} "
+    "Honesty: "
+    "{Honesty} "
+    "Begin your final evaluation by comparing the two responses carefully about each attribute, analyzing the weight for each attribute, and providing a short explanation. "  # This is not in `prompt_v2_gemini`
     "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
     "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
     "Be as objective as possible. "
@@ -499,7 +587,7 @@ def process_judgement(judgment, model_modifier):
 
 
 # noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
-def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None):
+def run_judge_pair(args, question, answer_a, answer_b, model, multi_turn=False, model_modifier=None):
     system_prompt, user_prompt = format_judge_answers(
         question, answer_a, answer_b, multi_turn, model_modifier=model_modifier
     )
@@ -510,7 +598,7 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         winners = []
         judgments = []
         for m in model:
-            winner, _, judgment = run_judge_pair(question, answer_a, answer_b, m, multi_turn)
+            winner, _, judgment = run_judge_pair(args, question, answer_a, answer_b, m, multi_turn)
             winners.append(winner)
             judgments.append(judgment)
         return winners, user_prompt, judgments
@@ -533,7 +621,10 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         conv.append_message(conv.roles[1], None)
         conv.messages = conv.to_openai_api_messages()
 
-        judgment = chat_completion_anthropic(model, conv, temperature=0, max_tokens=1024)
+        if args.multi_llm:
+            judgment = chat_completion_anthropic_multi_llm(model, conv, temperature=0, max_tokens=1024)
+        else:
+            judgment = chat_completion_anthropic(model, conv, temperature=0, max_tokens=1024)
     elif model in GEMINI_MODEL_LIST:
         text = user_prompt
         judgment = chat_completion_gemini(model, text, temperature=0, max_tokens=4096)
@@ -760,35 +851,147 @@ def run_judge_ratings(
 # also uses ArenaHard code
 # noqa https://github.com/lm-sys/arena-hard/blob/51c04e5a6449e920c01d4159f56a051216af6bd9/utils.py#L166
 def chat_completion_anthropic(model, conv, temperature, max_tokens, api_dict=None):
-    if api_dict is not None and "api_key" in api_dict:
-        api_key = api_dict["api_key"]
-    else:
-        api_key = os.environ["ANTHROPIC_API_KEY"]
+    # if api_dict is not None and "api_key" in api_dict:
+    #     api_key = api_dict["api_key"]
+    # else:
+    #     api_key = os.environ["ANTHROPIC_API_KEY"]
 
     sys_msg = ""
     if conv.messages[0]["role"] == "system":
         sys_msg = conv.messages[0]["content"]
         conv.messages = conv.messages[1:]
 
+    body = json.dumps({
+        "system": sys_msg,
+        'temperature': temperature,
+        'stop_sequences': [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
     output = API_ERROR_OUTPUT
     for _ in range(API_MAX_RETRY):
         try:
-            c = anthropic.Anthropic(api_key=api_key)
-            response = c.messages.create(
-                model=model,
-                messages=conv.messages,
-                stop_sequences=[anthropic.HUMAN_PROMPT],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=sys_msg,
+            # c = anthropic.Anthropic(api_key=api_key)
+            # response = c.messages.create(
+            #     model=model,
+            #     messages=conv.messages,
+            #     stop_sequences=[anthropic.HUMAN_PROMPT],
+            #     max_tokens=max_tokens,
+            #     temperature=temperature,
+            #     system=sys_msg,
+            # )
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
             )
-            output = response.content[0].text
+            response_body = json.loads(response.get("body").read())
+ 
+            content = response_body.get("content")
+            output = content[0]['text']
+            # output = response.content[0].text
             break
         except anthropic.APIError as e:
             print(type(e), e)
             time.sleep(API_RETRY_SLEEP)
+
     return output.strip()
 
+def invoke_with_retries(prompt, conv, temperature, max_tokens):
+    body = json.dumps({
+        "system": prompt,
+        "temperature": temperature,
+        "stop_sequences": [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
+
+    for _ in range(API_MAX_RETRY):
+        try:
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+            )
+            response_body = json.loads(response.get("body").read())
+            content = response_body.get("content")
+            return content[0]['text']
+        except Exception as e:
+            print(f"Retrying due to: {type(e).__name__} - {e}")
+            time.sleep(API_RETRY_SLEEP)
+
+    return API_ERROR_OUTPUT
+
+def chat_completion_anthropic_multi_llm(model, conv, temperature, max_tokens, api_dict=None):
+    
+    attributes = ['helpfulness','correctness','verbosity',
+                  'instruction_following', 'truthfulness', 'honesty']
+    sys_msg = ""
+    if conv.messages[0]["role"] == "system":
+        sys_msg = conv.messages[0]["content"]
+        conv.messages = conv.messages[1:]
+
+    prompts = {
+    "helpfulness": prompt_v2_helpfulness,
+    "correctness": prompt_v2_correctness,
+    "instruction": prompt_v2_instruction,
+    "verbosity": prompt_v2_verbosity,
+    "truthfulness": prompt_v2_truthfulness,
+    "honesty": prompt_v2_honesty
+}
+
+# result dict to store outputs
+    results = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        # Launch tasks
+        futures = {
+            name: executor.submit(invoke_with_retries, prompt, conv, temperature, max_tokens)
+            for name, prompt in prompts.items()
+        }
+
+        # Wait and collect results
+        for name, future in futures.items():
+            results[name] = future.result()
+
+    # Now you can use:
+    helpfulness = results['helpfulness']
+    correctness = results['correctness']
+    instruction = results['instruction']
+    verbosity = results['verbosity']
+    truthfulness = results['truthfulness']
+    honesty = results['honesty']
+
+    final_sys = prompt_v2_overall.format(Helpfulness=helpfulness,Instruction=instruction,Verbosity=verbosity,Correctness=correctness,Truthfulness=truthfulness,Honesty=honesty)
+    body = json.dumps({
+        "system": final_sys,
+        'temperature': temperature,
+        'stop_sequences': [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+            )
+            response_body = json.loads(response.get("body").read())
+ 
+            content = response_body.get("content")
+            output = content[0]['text']
+            # output = response.content[0].text
+            break
+        except anthropic.APIError as e:
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+
+    return output.strip()
 
 def chat_completion_gemini(model, conv, temperature, max_tokens, api_dict=None):
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
