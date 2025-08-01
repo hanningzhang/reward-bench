@@ -91,6 +91,9 @@ def get_args():
     parser.add_argument(
         "--force_local", action="store_true", default=False, help="force local run, even if model is on Together API"
     )
+    parser.add_argument(
+        "--multi_llm", default=False, help="multi-llm for each attribute"
+    )
     args = parser.parse_args()
     return args
 
@@ -229,7 +232,7 @@ def main():
             if len(batch["text_chosen"]) <= 4:  # set up only for 1 or 2 turns
                 if not args.score_w_ratings:
                     winner, request, judgement = run_judge_pair(
-                        prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, model_modifier=model_modifier
+                        args, prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, model_modifier=model_modifier
                     )
                     if debug:
                         print(f"Prompt: {request}")
