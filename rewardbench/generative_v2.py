@@ -21,7 +21,11 @@
 import os
 import re
 import time as time
+import json
+import concurrent.futures
 
+import boto3
+from botocore.config import Config
 import anthropic
 import google.generativeai as genai
 import openai
@@ -44,6 +48,8 @@ ANTHROPIC_MODEL_LIST = (
     "claude-3-7-sonnet-20250219",
     "claude-opus-4-20250514",
     "claude-sonnet-4-20250514",
+    "claude-sonnet-4",
+    "claude-sonnet-3.7"
 )
 
 OPENAI_MODEL_LIST = (
@@ -109,7 +115,77 @@ prompt_v2 = (
     "of the assistants. Be as objective as possible. After providing your explanation, output your final verdict by strictly following this format: "
     '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, "[[C]]" if assistant C is best, and "[[D]]" if assistant D is best.'
 )
-
+prompt_v2_helpfulness = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: helpfulness. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_relevance = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: relevance. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_accuracy = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: accuracy. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_depth = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: depth. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_creativity = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: creativity. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_detail = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question displayed below. "
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Your evaluation should only consider the factor: level of detail. Begin your evaluation by "
+    "comparing the four responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
+    "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+    "of the assistants. Be as objective as possible."
+)
+prompt_v2_overall = (
+    "Please act as an impartial judge and evaluate the quality of the responses provided by four AI assistants to the user question given the judgment results of each attribute."
+    "You should choose the assistant that follows the user's instructions and answers the user's question best. "
+    "Below we provide the judgment result of each attribute. "
+    "helpfulness: "
+    "{helpfulness} "
+    "relevance: "
+    "{relevance} "
+    "accuracy: "
+    "{accuracy} "
+    "depth: "
+    "{depth} "
+    "creativity: "
+    "{creativity} "
+    "level of detail: "
+    "{detail} "
+    "Begin your final evaluation by comparing the four responses carefully about each attribute, analyzing the weight for each attribute, and providing a short explanation. "  # This is not in `prompt_v2_gemini`
+    "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "
+    "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "
+    "Be as objective as possible. "
+    "After providing your explanation, output your final verdict by strictly following this format: "  # This is not in `prompt_v2_gemini`
+    '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, "[[C]]" if assistant C is best, and "[[D]]" if assistant D is best.'
+)
 # used for gemini pro llm as a judge (API implementation coming soon)
 # implementation details shared from Gemini Alignment Team
 # usage is as follows:
@@ -173,7 +249,7 @@ def process_judgement(judgment, model_modifier):
 
 
 # noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
-def run_judge_four(question, answer_a, answer_b, answer_c, answer_d, model, multi_turn=False, model_modifier=None):
+def run_judge_four(args, question, answer_a, answer_b, answer_c, answer_d, model, multi_turn=False, model_modifier=None):
     system_prompt, user_prompt = format_judge_answers(
         question, answer_a, answer_b, answer_c, answer_d, multi_turn, model_modifier=model_modifier
     )
@@ -206,8 +282,10 @@ def run_judge_four(question, answer_a, answer_b, answer_c, answer_d, model, mult
         conv.append_message(conv.roles[0], user_prompt)
         conv.append_message(conv.roles[1], None)
         conv.messages = conv.to_openai_api_messages()
-
-        judgment = chat_completion_anthropic(model, conv, temperature=0, max_tokens=1024)
+        if args.multi_llm:
+            judgment = chat_completion_anthropic_multi_llm(model, conv, temperature=0, max_tokens=1024)
+        else:
+            judgment = chat_completion_anthropic(model, conv, temperature=0, max_tokens=1024)
     elif model in GEMINI_MODEL_LIST:
         text = user_prompt
         judgment = chat_completion_gemini(model, text, temperature=0, max_tokens=4096)
@@ -248,7 +326,14 @@ def chat_completion(
             api_key=os.environ["GEMINI_API_KEY"], base_url="https://generativelanguage.googleapis.com/v1beta/openai"
         )
     elif model in ANTHROPIC_MODEL_LIST:
-        _client = anthropic.Anthropic()
+        # _client = anthropic.Anthropic()
+        config = Config(
+                retries = {
+                    'max_attempts': 10,  # default is 4
+                    'mode': 'standard'   # 'standard' or 'adaptive'
+                }
+            )
+        bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2',config=config)
 
     for attempt in range(1, retries + 1):
         try:
@@ -268,8 +353,27 @@ def chat_completion(
 
             if model in ANTHROPIC_MODEL_LIST:
                 # Anthropic API
-                resp = _client.messages.create(**params)
-                response = resp.content[0].text
+                new_params = params
+                new_params.pop("model")
+                new_params["anthropic_version"] =  "bedrock-2023-05-31"
+                body = json.dumps(new_params)
+                response = API_ERROR_OUTPUT
+                for _ in range(API_MAX_RETRY):
+                    try:
+                        response_raw = bedrock.invoke_model(body=body,
+                            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                            modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+                        )
+                        response_body = json.loads(response_raw.get("body").read())
+ 
+                        content = response_body.get("content")
+                        response = content[0]['text']
+                        break
+                    except anthropic.APIError as e:
+                        print(type(e), e)
+                        time.sleep(API_RETRY_SLEEP)
+                # resp = _client.messages.create(**params)
+                # response = resp.content[0].text
             elif model in OPENAI_MODEL_LIST or model in GEMINI_MODEL_LIST:
                 # OpenAI API
                 resp = _client.chat.completions.create(**params)
@@ -305,6 +409,152 @@ Notes:
 
 [Your judgement]"""
 
+ratings_prompt_helpfulness = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: helpfulness.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+ratings_prompt_relevance = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: relevance.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+ratings_prompt_accuracy = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: accuracy.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+ratings_prompt_depth = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: depth.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+ratings_prompt_creativity = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: creativity.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+ratings_prompt_detail = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+1- Your evaluation should only consider the factors: level of detail.
+2- Begin your evaluation by providing a short explanation.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[Your judgement]"""
+
+
+ratings_prompt_overall = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below given the judgment results of each attribute.
+
+Notes:
+1- You should analyze the weight for each attribute, and provide a short explanation.
+2- You should provide a final rating score based on the judgment for each attribute and the weight for each attribute.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[helpfulness Judgment]
+{helpfulness}
+
+[relevance Judgment]
+{relevance}
+
+[accuracy Judgment]
+{accuracy}
+
+[depth Judgment]
+{depth}
+
+[creativity Judgment]
+{creativity}
+
+[level of detail Judgment]
+{detail}
+
+[Final judgement]"""
+
+
 ratings_prompt_ties = """
 ### Task Description
 Please act as an impartial judge and evaluate the quality of the response provided by an
@@ -323,9 +573,37 @@ Notes:
 
 [Your judgement]"""
 
+ratings_prompt_tie_overall = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below given the judgment results of each attribute.
+
+Notes:
+1- You should analyze the weight for each attribute, and provide a short explanation.
+2- You should provide a final rating score based on the judgment for each attribute and the weight for each attribute.
+3- Be as objective as possible. After providing your explanation, please rate the response on a scale of 1 to 10. For your rating, only give a number between 1 and 10 (inclusive), do not use any markdown, and do not put any text after your final rating.
+
+[Query]
+{prompt}
+
+[Response]
+{completion}
+
+[helpfulness Judgment]
+{helpfulness}
+
+[relevance Judgment]
+{relevance}
+
+[accuracy Judgment]
+{accuracy}
+
+[Final judgement]"""
+
 
 # Function to get a single rating from an LLM
 def get_single_rating(
+    args,
     question_text: str,
     answer_text: str,
     model: str,
@@ -403,6 +681,172 @@ def get_single_rating(
 
     return parsed_rating, raw_judgment
 
+def invoke_with_retries_score_rating(prompt, temperature=0.0, max_tokens=1024):
+    messages = []
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps({
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
+
+    for _ in range(API_MAX_RETRY):
+        try:
+            config = Config(
+                retries = {
+                    'max_attempts': 10,  # default is 4
+                    'mode': 'standard'   # 'standard' or 'adaptive'
+                }
+            )
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2',config=config)
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+            )
+            response_body = json.loads(response.get("body").read())
+            content = response_body.get("content")
+            return content[0]['text']
+        except Exception as e:
+            print(f"Retrying due to: {type(e).__name__} - {e}")
+            time.sleep(API_RETRY_SLEEP)
+
+    return API_ERROR_OUTPUT
+
+def get_single_rating_multi_llm(
+    args,
+    question_text: str,
+    answer_text: str,
+    model: str,
+    model_modifier: str = None,
+    is_ties: bool = False,
+    vllm_model=None,
+):
+    #return output.strip()
+    if is_ties:
+        #user_prompt = ratings_prompt_ties.format(prompt=question_text, completion=answer_text)
+        prompts = {
+            "helpfulness": ratings_prompt_helpfulness.format(prompt=question_text, completion=answer_text),
+            "relevance": ratings_prompt_relevance.format(prompt=question_text, completion=answer_text),
+            "accuracy": ratings_prompt_accuracy.format(prompt=question_text, completion=answer_text),
+                    }
+
+        # result dict to store outputs
+        results = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Launch tasks
+            futures = {
+                name: executor.submit(invoke_with_retries_score_rating, prompt, temperature=0.0, max_tokens=1024)
+                for name, prompt in prompts.items()
+            }
+
+            # Wait and collect results
+            for name, future in futures.items():
+                results[name] = future.result()
+
+        # Now you can use:
+        helpfulness = results['helpfulness']
+        relevance = results['relevance']
+        accuracy = results['accuracy']
+        
+        final_sys = ratings_prompt_tie_overall.format(prompt=question_text, completion=answer_text,helpfulness=helpfulness,relevance=relevance,accuracy=accuracy)
+        messages = [{"role":"user","content":final_sys}]
+        body = json.dumps({
+        'temperature': 0.0,
+        "max_tokens": 1024,
+        "messages": messages,
+        "anthropic_version": "bedrock-2023-05-31"
+        })
+        raw_judgment = API_ERROR_OUTPUT
+        for _ in range(API_MAX_RETRY):
+            try:
+                bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+                response = bedrock.invoke_model(body=body,
+                    #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                    modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+                )
+                response_body = json.loads(response.get("body").read())
+ 
+                content = response_body.get("content")
+                raw_judgment = content[0]['text']
+                break
+            except anthropic.APIError as e:
+                print(type(e), e)
+                time.sleep(API_RETRY_SLEEP)
+    
+    else:
+        prompts = {
+            "helpfulness": ratings_prompt_helpfulness.format(prompt=question_text, completion=answer_text),
+            "relevance": ratings_prompt_relevance.format(prompt=question_text, completion=answer_text),
+            "accuracy": ratings_prompt_accuracy.format(prompt=question_text, completion=answer_text),
+            "depth": ratings_prompt_depth.format(prompt=question_text, completion=answer_text),
+            "creativity": ratings_prompt_creativity.format(prompt=question_text, completion=answer_text),
+            "detail": ratings_prompt_detail.format(prompt=question_text, completion=answer_text)
+                    }
+
+        # result dict to store outputs
+        results = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            # Launch tasks
+            futures = {
+                name: executor.submit(invoke_with_retries_score_rating, prompt, temperature=0.0, max_tokens=1024)
+                for name, prompt in prompts.items()
+            }
+
+            # Wait and collect results
+            for name, future in futures.items():
+                results[name] = future.result()
+
+        # Now you can use:
+        helpfulness = results['helpfulness']
+        relevance = results['relevance']
+        accuracy = results['accuracy']
+        depth = results['depth']
+        creativity = results['creativity']
+        detail = results['detail']
+        
+        final_sys = ratings_prompt_overall.format(prompt=question_text, completion=answer_text,helpfulness=helpfulness,relevance=relevance,accuracy=accuracy,depth=depth,creativity=creativity,detail=detail)
+        messages = [{"role":"user","content":final_sys}]
+        body = json.dumps({
+        'temperature': 0.0,
+        "max_tokens": 1024,
+        "messages": messages,
+        "anthropic_version": "bedrock-2023-05-31"
+        })
+        raw_judgment = API_ERROR_OUTPUT
+        for _ in range(API_MAX_RETRY):
+            try:
+                bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+                response = bedrock.invoke_model(body=body,
+                    #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                    modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+                )
+                response_body = json.loads(response.get("body").read())
+ 
+                content = response_body.get("content")
+                raw_judgment = content[0]['text']
+                break
+            except anthropic.APIError as e:
+                print(type(e), e)
+                time.sleep(API_RETRY_SLEEP)
+
+    parsed_rating = -1
+    try:
+        # parse a trailing integer 1–10
+        if raw_judgment and raw_judgment != API_ERROR_OUTPUT:
+            m = re.search(r"\b([1-9]|10)\b\s*$", raw_judgment.strip())
+            if m:
+                rating = int(m.group(1))
+                if 1 <= rating <= 10:
+                    parsed_rating = rating
+
+    except Exception as e:
+        print(f"Error during rating for model={model}," f" question={question_text[:30]!r}: {e}")
+        # parsed_rating stays -1, raw_judgment may hold API_ERROR_OUTPUT or error text
+
+    return parsed_rating, raw_judgment
 
 def _get_vllm_rating(user_prompt: str, system_prompt: str, vllm_model, model_modifier: str = None):
     """
@@ -449,6 +893,7 @@ def _get_vllm_rating(user_prompt: str, system_prompt: str, vllm_model, model_mod
 
 
 def run_judge_ratings_multi(
+    args,
     question: str,
     all_answers: list[list[dict]],
     model: str,
@@ -501,7 +946,10 @@ def run_judge_ratings_multi(
     judgments = []
     prompts = []
     for q, c in zip(queries, completions):
-        r, raw_j = get_single_rating(q, c, model, model_modifier, is_ties, vllm_model)
+        if args.multi_llm:
+            r, raw_j = get_single_rating_multi_llm(args, q, c, model, model_modifier, is_ties, vllm_model)
+        else:
+            r, raw_j = get_single_rating(args, q, c, model, model_modifier, is_ties, vllm_model)
         ratings.append(r)
         judgments.append(raw_j)
         prompts.append(
@@ -527,35 +975,143 @@ def run_judge_ratings_multi(
 # also uses ArenaHard code
 # noqa https://github.com/lm-sys/arena-hard/blob/51c04e5a6449e920c01d4159f56a051216af6bd9/utils.py#L166
 def chat_completion_anthropic(model, conv, temperature, max_tokens, api_dict=None):
-    if api_dict is not None and "api_key" in api_dict:
-        api_key = api_dict["api_key"]
-    else:
-        api_key = os.environ["ANTHROPIC_API_KEY"]
+    if conv.messages[0]["role"] == "system":
+        sys_msg = conv.messages[0]["content"]
+        conv.messages = conv.messages[1:]
 
+    body = json.dumps({
+        "system": sys_msg,
+        'temperature': temperature,
+        'stop_sequences': [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            config = Config(
+                retries = {
+                    'max_attempts': 10,  # default is 4
+                    'mode': 'standard'   # 'standard' or 'adaptive'
+                }
+            )
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2',config=config)
+            response = bedrock.invoke_model(body=body,
+                #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+            )
+            response_body = json.loads(response.get("body").read())
+ 
+            content = response_body.get("content")
+            output = content[0]['text']
+            break
+        except anthropic.APIError as e:
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+
+    return output.strip()
+
+def invoke_with_retries(prompt, conv, temperature, max_tokens):
+    body = json.dumps({
+        "system": prompt,
+        "temperature": temperature,
+        "stop_sequences": [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
+
+    for _ in range(API_MAX_RETRY):
+        try:
+            config = Config(
+                retries = {
+                    'max_attempts': 10,  # default is 4
+                    'mode': 'standard'   # 'standard' or 'adaptive'
+                }
+            )
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2',config=config)
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+            )
+            response_body = json.loads(response.get("body").read())
+            content = response_body.get("content")
+            return content[0]['text']
+        except Exception as e:
+            print(f"Retrying due to: {type(e).__name__} - {e}")
+            time.sleep(API_RETRY_SLEEP)
+
+    return API_ERROR_OUTPUT
+
+def chat_completion_anthropic_multi_llm(model, conv, temperature, max_tokens, api_dict=None):
+    
+    # attributes = ['helpfulness','correctness','verbosity',
+    #               'instruction_following', 'truthfulness', 'honesty']
     sys_msg = ""
     if conv.messages[0]["role"] == "system":
         sys_msg = conv.messages[0]["content"]
         conv.messages = conv.messages[1:]
 
+    prompts = {
+    "helpfulness": prompt_v2_helpfulness,
+    "relevance": prompt_v2_relevance,
+    "accuracy": prompt_v2_accuracy,
+    "depth": prompt_v2_depth,
+    "creativity": prompt_v2_creativity,
+    "detail": prompt_v2_detail
+}
+
+# result dict to store outputs
+    results = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        # Launch tasks
+        futures = {
+            name: executor.submit(invoke_with_retries, prompt, conv, temperature, max_tokens)
+            for name, prompt in prompts.items()
+        }
+
+        # Wait and collect results
+        for name, future in futures.items():
+            results[name] = future.result()
+
+    # Now you can use:
+    helpfulness = results['helpfulness']
+    relevance = results['relevance']
+    accuracy = results['accuracy']
+    depth = results['depth']
+    creativity = results['creativity']
+    detail = results['detail']
+
+    final_sys = prompt_v2_overall.format(helpfulness=helpfulness,relevance=relevance,accuracy=accuracy,depth=depth,creativity=creativity,detail=detail)
+    body = json.dumps({
+        "system": final_sys,
+        'temperature': temperature,
+        'stop_sequences': [anthropic.HUMAN_PROMPT],
+        "max_tokens": max_tokens,
+        "messages": conv.messages,
+        "anthropic_version": "bedrock-2023-05-31"
+    })
     output = API_ERROR_OUTPUT
     for _ in range(API_MAX_RETRY):
         try:
-            c = anthropic.Anthropic(api_key=api_key)
-            response = c.messages.create(
-                model=model,
-                messages=conv.messages,
-                stop_sequences=[anthropic.HUMAN_PROMPT],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=sys_msg,
+            bedrock = boto3.client(service_name="bedrock-runtime",region_name='us-west-2')
+            response = bedrock.invoke_model(body=body,
+            #modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0',
+                modelId='arn:aws:bedrock:us-west-2:684288478426:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
             )
-            output = response.content[0].text
+            response_body = json.loads(response.get("body").read())
+ 
+            content = response_body.get("content")
+            output = content[0]['text']
+            # output = response.content[0].text
             break
         except anthropic.APIError as e:
             print(type(e), e)
             time.sleep(API_RETRY_SLEEP)
-    return output.strip()
 
+    return output.strip()
 
 def chat_completion_gemini(model, conv, temperature, max_tokens, api_dict=None):
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
